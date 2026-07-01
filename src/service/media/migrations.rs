@@ -43,7 +43,7 @@ pub(crate) async fn migrate_sha256_media(services: &Services) -> Result<()> {
 		if old_path.exists() {
 			tokio::fs::rename(&old_path, &path).await?;
 			if config.media_compat_file_link {
-				tokio::fs::symlink(&path, &old_path).await?;
+				super::symlink_compat(&path, &old_path).await?;
 			}
 		}
 	}
@@ -130,7 +130,7 @@ async fn handle_media_check(
 			"Media found but missing legacy link. Fixing..."
 		);
 
-		tokio::fs::symlink(&new_path, &old_path).await?;
+		super::symlink_compat(&new_path, &old_path).await?;
 	}
 
 	if config.media_compat_file_link && !new_exists && old_exists {
@@ -145,7 +145,7 @@ async fn handle_media_check(
 		);
 
 		tokio::fs::rename(&old_path, &new_path).await?;
-		tokio::fs::symlink(&new_path, &old_path).await?;
+		super::symlink_compat(&new_path, &old_path).await?;
 	}
 
 	if !config.media_compat_file_link && old_exists && old_is_symlink().await {

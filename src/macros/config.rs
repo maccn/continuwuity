@@ -100,6 +100,16 @@ fn generate_example(input: &ItemStruct, args: &[Meta], write: bool) -> Result<To
 				continue;
 			};
 
+			// Preserve any `#[cfg(...)]` on the field so generated `self.#ident`
+			// references are only emitted on targets where the field exists
+			// (e.g. unix-only `log_to_journald`). Without this, the Display impl
+			// references cfg'd-out fields and fails to compile on Windows.
+			let cfg_attrs: Vec<&syn::Attribute> = field
+				.attrs
+				.iter()
+				.filter(|attr| attr.path().is_ident("cfg"))
+				.collect();
+
 			let display = get_doc_comment_line(field, "display");
 			let display_directive = |key| {
 				display
@@ -148,17 +158,20 @@ fn generate_example(input: &ItemStruct, args: &[Meta], write: bool) -> Result<To
 
 			if display_directive("sensitive") {
 				summary.push(quote! {
+					#(#cfg_attrs)*
 					writeln!(out, "| {} | {} |", #name, "***********")?;
 				});
 			} else if is_nested {
 				let is_option = matches!(type_name.as_str(), "Option");
 				if is_option {
 					summary.push(quote! {
+						#(#cfg_attrs)*
 						writeln!(out, "| {} | {} |", #name,
 							if self.#ident.is_some() { "[configured]" } else { "None" })?;
 					});
 
 					nested_displays.push(quote! {
+						#(#cfg_attrs)*
 						if let Some(nested) = &self.#ident {
 							writeln!(out)?;
 							writeln!(out, "## {}", #name)?;
@@ -167,17 +180,22 @@ fn generate_example(input: &ItemStruct, args: &[Meta], write: bool) -> Result<To
 					});
 				} else {
 					summary.push(quote! {
+						#(#cfg_attrs)*
 						writeln!(out, "| {} | [configured] |", #name)?;
 					});
 
 					nested_displays.push(quote! {
-						writeln!(out)?;
-						writeln!(out, "## {}", #name)?;
-						write!(out, "{}", &self.#ident)?;
+						#(#cfg_attrs)*
+						{
+							writeln!(out)?;
+							writeln!(out, "## {}", #name)?;
+							write!(out, "{}", &self.#ident)?;
+						}
 					});
 				}
 			} else {
 				summary.push(quote! {
+					#(#cfg_attrs)*
 					writeln!(out, "| {} | {:?} |", #name, self.#ident)?;
 				});
 			}

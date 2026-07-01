@@ -27,6 +27,30 @@ use self::data::{Data, Metadata};
 pub use self::thumbnail::Dim;
 use crate::{Dep, client, globals, media::mxc::Mxc, moderation, sending};
 
+/// Create a filesystem symlink in a cross-platform manner.
+///
+/// `tokio::fs::symlink` only exists on unix; Windows distinguishes file and
+/// directory symlinks. The media compat-link feature always points at regular
+/// files, so map to `symlink_file` there. Generic over `AsRef<Path>` to mirror
+/// the original `tokio::fs::symlink` signature (callers pass `OsStr`).
+#[cfg(unix)]
+pub(crate) async fn symlink_compat<P, Q>(original: P, link: Q) -> std::io::Result<()>
+where
+	P: AsRef<std::path::Path>,
+	Q: AsRef<std::path::Path>,
+{
+	fs::symlink(original.as_ref(), link.as_ref()).await
+}
+
+#[cfg(windows)]
+pub(crate) async fn symlink_compat<P, Q>(original: P, link: Q) -> std::io::Result<()>
+where
+	P: AsRef<std::path::Path>,
+	Q: AsRef<std::path::Path>,
+{
+	fs::symlink_file(original.as_ref(), link.as_ref()).await
+}
+
 #[derive(Debug)]
 pub struct FileMeta {
 	pub content: Option<Vec<u8>>,
@@ -371,7 +395,7 @@ impl Service {
 		let file = fs::File::create(&path).await?;
 		if self.services.server.config.media_compat_file_link {
 			let legacy = self.get_media_file_b64(key);
-			if let Err(e) = fs::symlink(&path, &legacy).await {
+			if let Err(e) = symlink_compat(&path, &legacy).await {
 				debug_error!(
 					key = ?encode_key(key), ?path, ?legacy,
 					"Failed to create legacy media symlink: {e}"
