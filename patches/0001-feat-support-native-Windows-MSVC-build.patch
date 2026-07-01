@@ -1,0 +1,288 @@
+From 01af461c5b8bf3313ab5517ddc240894fc9cc25b Mon Sep 17 00:00:00 2001
+From: maccn <uuhunter@gmail.com>
+Date: Wed, 1 Jul 2026 21:32:16 +1000
+Subject: [PATCH] feat: support native Windows (MSVC) build
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Make continuwuity compile and run natively on x86_64-pc-windows-msvc
+(no WSL/Docker). Build with:
+
+  cargo build --release --no-default-features --features \
+    "zstd_compression,brotli_compression,gzip_compression,\
+     media_thumbnail,url_preview,ring,element_hacks,\
+     bindgen-runtime,release_max_log_level"
+
+(Linux-only features off: io_uring / jemalloc / systemd / journald /
+hardened_malloc. RocksDB builds under MSVC unchanged; no fork edits.)
+
+These are conditional-compilation gaps that only surface off-unix; none
+change protocol, database, auth, or federation semantics. The set is
+atomic — each fix resolves a distinct Windows compile error and only the
+full set builds, so they land as one commit to keep the tree buildable.
+
+Fixes:
+- media: add cross-platform `symlink_compat()` (unix `fs::symlink`,
+  windows `fs::symlink_file`; generic over AsRef<Path>) and route the 4
+  legacy-compat-link call sites (mod.rs + migrations.rs x3) through it.
+  `tokio::fs::symlink` is unix-only; Windows splits file/dir symlinks.
+- admin: keep the `Restart` subcommand variant on all platforms (drop
+  its `#[cfg(unix)]`) so the `#[admin_command_dispatch]` proc-macro's
+  generated arm is not left dangling (E0422); add a `#[cfg(not(unix))]`
+  `restart()` stub returning an error (E0599). In-place re-exec via
+  `execvp` stays unix-only.
+- router/serve: gate `mod unix;` and the unix-socket branch behind
+  `#[cfg(unix)]` (the module is `#![cfg(unix)]`, so `unix::serve` does
+  not exist on Windows -> E0433). TLS/plain paths unchanged.
+- sys/storage: split `dev_from_path` into a unix impl and a
+  `#[cfg(not(target_family="unix"))]` stub returning (0,0). Block-device
+  major/minor comes from Linux sysfs; downstream (RocksDB pool auto-tune)
+  already tolerates the fallback via `.log_debug_err().unwrap_or_default()`.
+- macros/config: propagate a field's `#[cfg(...)]` onto the generated
+  `self.#ident` references in the config Display impl, so unix-only
+  fields (e.g. `log_to_journald`) don't dangle off-unix.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ src/admin/server/commands.rs    |  7 +++++++
+ src/admin/server/mod.rs         |  1 -
+ src/core/utils/sys/storage.rs   |  7 ++++++-
+ src/macros/config.rs            | 24 +++++++++++++++++++++---
+ src/router/serve/mod.rs         | 11 ++++++++---
+ src/service/media/migrations.rs |  6 +++---
+ src/service/media/mod.rs        | 26 +++++++++++++++++++++++++-
+ 7 files changed, 70 insertions(+), 12 deletions(-)
+
+diff --git a/src/admin/server/commands.rs b/src/admin/server/commands.rs
+index 744dde43e..608eafffe 100644
+--- a/src/admin/server/commands.rs
++++ b/src/admin/server/commands.rs
+@@ -133,6 +133,13 @@ pub(super) async fn restart(&self, force: bool) -> Result {
+ 		self.write_str("Restarting server...").await
+ 	}
+ 
++	#[cfg(not(unix))]
++	pub(super) async fn restart(&self, _force: bool) -> Result {
++		// In-place re-exec is implemented via `execvp` in `main/restart.rs`, which
++		// is unix-only. There is no equivalent restart path on other platforms.
++		Err!("Restarting the server is only supported on unix platforms.")
++	}
++
+ 	pub(super) async fn shutdown(&self) -> Result {
+ 		self.bail_restricted()?;
+ 
+diff --git a/src/admin/server/mod.rs b/src/admin/server/mod.rs
+index 1f65a99ea..0d07bc990 100644
+--- a/src/admin/server/mod.rs
++++ b/src/admin/server/mod.rs
+@@ -43,7 +43,6 @@ pub enum ServerCommand {
+ 	#[clap(alias = "reload")]
+ 	ReloadMods,
+ 
+-	#[cfg(unix)]
+ 	/// Restart the server
+ 	Restart {
+ 		#[arg(short, long)]
+diff --git a/src/core/utils/sys/storage.rs b/src/core/utils/sys/storage.rs
+index b71c34373..99c9ad0e9 100644
+--- a/src/core/utils/sys/storage.rs
++++ b/src/core/utils/sys/storage.rs
+@@ -116,9 +116,9 @@ pub fn name_from_path(path: &Path) -> Result<String> {
+ }
+ 
+ /// Get the (major, minor) of the block device on which Path is mounted.
++#[cfg(target_family = "unix")]
+ #[allow(clippy::useless_conversion, clippy::unnecessary_fallible_conversions)]
+ fn dev_from_path(path: &Path) -> Result<(dev_t, dev_t)> {
+-	#[cfg(target_family = "unix")]
+ 	use std::os::unix::fs::MetadataExt;
+ 
+ 	let stat = fs::metadata(path)?;
+@@ -128,6 +128,11 @@ fn dev_from_path(path: &Path) -> Result<(dev_t, dev_t)> {
+ 	Ok((major.try_into()?, minor.try_into()?))
+ }
+ 
++/// Block-device introspection relies on Linux sysfs; unavailable elsewhere.
++#[cfg(not(target_family = "unix"))]
++#[allow(clippy::unnecessary_wraps)]
++fn dev_from_path(_path: &Path) -> Result<(dev_t, dev_t)> { Ok((0, 0)) }
++
+ fn block_path((major, minor): (dev_t, dev_t)) -> PathBuf {
+ 	format!("/sys/dev/block/{major}:{minor}/").into()
+ }
+diff --git a/src/macros/config.rs b/src/macros/config.rs
+index b0b42eddd..628ba42e8 100644
+--- a/src/macros/config.rs
++++ b/src/macros/config.rs
+@@ -100,6 +100,16 @@ fn generate_example(input: &ItemStruct, args: &[Meta], write: bool) -> Result<To
+ 				continue;
+ 			};
+ 
++			// Preserve any `#[cfg(...)]` on the field so generated `self.#ident`
++			// references are only emitted on targets where the field exists
++			// (e.g. unix-only `log_to_journald`). Without this, the Display impl
++			// references cfg'd-out fields and fails to compile on Windows.
++			let cfg_attrs: Vec<&syn::Attribute> = field
++				.attrs
++				.iter()
++				.filter(|attr| attr.path().is_ident("cfg"))
++				.collect();
++
+ 			let display = get_doc_comment_line(field, "display");
+ 			let display_directive = |key| {
+ 				display
+@@ -148,17 +158,20 @@ fn generate_example(input: &ItemStruct, args: &[Meta], write: bool) -> Result<To
+ 
+ 			if display_directive("sensitive") {
+ 				summary.push(quote! {
++					#(#cfg_attrs)*
+ 					writeln!(out, "| {} | {} |", #name, "***********")?;
+ 				});
+ 			} else if is_nested {
+ 				let is_option = matches!(type_name.as_str(), "Option");
+ 				if is_option {
+ 					summary.push(quote! {
++						#(#cfg_attrs)*
+ 						writeln!(out, "| {} | {} |", #name,
+ 							if self.#ident.is_some() { "[configured]" } else { "None" })?;
+ 					});
+ 
+ 					nested_displays.push(quote! {
++						#(#cfg_attrs)*
+ 						if let Some(nested) = &self.#ident {
+ 							writeln!(out)?;
+ 							writeln!(out, "## {}", #name)?;
+@@ -167,17 +180,22 @@ fn generate_example(input: &ItemStruct, args: &[Meta], write: bool) -> Result<To
+ 					});
+ 				} else {
+ 					summary.push(quote! {
++						#(#cfg_attrs)*
+ 						writeln!(out, "| {} | [configured] |", #name)?;
+ 					});
+ 
+ 					nested_displays.push(quote! {
+-						writeln!(out)?;
+-						writeln!(out, "## {}", #name)?;
+-						write!(out, "{}", &self.#ident)?;
++						#(#cfg_attrs)*
++						{
++							writeln!(out)?;
++							writeln!(out, "## {}", #name)?;
++							write!(out, "{}", &self.#ident)?;
++						}
+ 					});
+ 				}
+ 			} else {
+ 				summary.push(quote! {
++					#(#cfg_attrs)*
+ 					writeln!(out, "| {} | {:?} |", #name, self.#ident)?;
+ 				});
+ 			}
+diff --git a/src/router/serve/mod.rs b/src/router/serve/mod.rs
+index 0e86af8f7..b0cce279a 100644
+--- a/src/router/serve/mod.rs
++++ b/src/router/serve/mod.rs
+@@ -1,6 +1,7 @@
+ mod plain;
+ #[cfg(feature = "direct_tls")]
+ mod tls;
++#[cfg(unix)]
+ mod unix;
+ 
+ use std::sync::Arc;
+@@ -29,9 +30,13 @@ pub(super) async fn serve(
+ 
+ 	let addrs = config.get_bind_addrs();
+ 	let (app, _guard) = layers::build(&services)?;
+-	if cfg!(unix) && config.unix_socket_path.is_some() {
+-		unix::serve(server, app, shutdown).await
+-	} else if config.tls.certs.is_some() {
++
++	#[cfg(unix)]
++	if config.unix_socket_path.is_some() {
++		return unix::serve(server, app, shutdown).await;
++	}
++
++	if config.tls.certs.is_some() {
+ 		#[cfg(feature = "direct_tls")]
+ 		return tls::serve(server, app, handle, addrs).await;
+ 
+diff --git a/src/service/media/migrations.rs b/src/service/media/migrations.rs
+index 5fd628cd9..dea5cb8e2 100644
+--- a/src/service/media/migrations.rs
++++ b/src/service/media/migrations.rs
+@@ -43,7 +43,7 @@ pub(crate) async fn migrate_sha256_media(services: &Services) -> Result<()> {
+ 		if old_path.exists() {
+ 			tokio::fs::rename(&old_path, &path).await?;
+ 			if config.media_compat_file_link {
+-				tokio::fs::symlink(&path, &old_path).await?;
++				super::symlink_compat(&path, &old_path).await?;
+ 			}
+ 		}
+ 	}
+@@ -130,7 +130,7 @@ async fn handle_media_check(
+ 			"Media found but missing legacy link. Fixing..."
+ 		);
+ 
+-		tokio::fs::symlink(&new_path, &old_path).await?;
++		super::symlink_compat(&new_path, &old_path).await?;
+ 	}
+ 
+ 	if config.media_compat_file_link && !new_exists && old_exists {
+@@ -145,7 +145,7 @@ async fn handle_media_check(
+ 		);
+ 
+ 		tokio::fs::rename(&old_path, &new_path).await?;
+-		tokio::fs::symlink(&new_path, &old_path).await?;
++		super::symlink_compat(&new_path, &old_path).await?;
+ 	}
+ 
+ 	if !config.media_compat_file_link && old_exists && old_is_symlink().await {
+diff --git a/src/service/media/mod.rs b/src/service/media/mod.rs
+index 4ddee1343..800b45459 100644
+--- a/src/service/media/mod.rs
++++ b/src/service/media/mod.rs
+@@ -27,6 +27,30 @@
+ pub use self::thumbnail::Dim;
+ use crate::{Dep, client, globals, media::mxc::Mxc, moderation, sending};
+ 
++/// Create a filesystem symlink in a cross-platform manner.
++///
++/// `tokio::fs::symlink` only exists on unix; Windows distinguishes file and
++/// directory symlinks. The media compat-link feature always points at regular
++/// files, so map to `symlink_file` there. Generic over `AsRef<Path>` to mirror
++/// the original `tokio::fs::symlink` signature (callers pass `OsStr`).
++#[cfg(unix)]
++pub(crate) async fn symlink_compat<P, Q>(original: P, link: Q) -> std::io::Result<()>
++where
++	P: AsRef<std::path::Path>,
++	Q: AsRef<std::path::Path>,
++{
++	fs::symlink(original.as_ref(), link.as_ref()).await
++}
++
++#[cfg(windows)]
++pub(crate) async fn symlink_compat<P, Q>(original: P, link: Q) -> std::io::Result<()>
++where
++	P: AsRef<std::path::Path>,
++	Q: AsRef<std::path::Path>,
++{
++	fs::symlink_file(original.as_ref(), link.as_ref()).await
++}
++
+ #[derive(Debug)]
+ pub struct FileMeta {
+ 	pub content: Option<Vec<u8>>,
+@@ -371,7 +395,7 @@ async fn create_media_file(&self, key: &[u8]) -> Result<fs::File> {
+ 		let file = fs::File::create(&path).await?;
+ 		if self.services.server.config.media_compat_file_link {
+ 			let legacy = self.get_media_file_b64(key);
+-			if let Err(e) = fs::symlink(&path, &legacy).await {
++			if let Err(e) = symlink_compat(&path, &legacy).await {
+ 				debug_error!(
+ 					key = ?encode_key(key), ?path, ?legacy,
+ 					"Failed to create legacy media symlink: {e}"
+-- 
+2.52.0.windows.1
+
