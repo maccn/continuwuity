@@ -662,6 +662,23 @@ path = "src/ruminuwuity"
 strip = "symbols"
 lto = "thin"
 
+# 本地新增 profile(相对上游):为 Windows native 构建压缩 exe 体积。
+# 用法:cargo build --profile release-small --no-default-features --features "..."
+# 继承上游 [profile.release](strip="symbols" + lto="thin"),再叠加体积优先项:
+#   - lto="fat"          跨 crate 整体优化 + 更彻底的死代码消除(链接变慢,但 exe 更小)
+#   - codegen-units=1    单一 codegen 单位,允许更激进的死代码消除与内联裁剪
+#   - opt-level="z"      Rust 侧按体积优化(注:只影响 Rust 代码,
+#                        RocksDB 的 C++ 仍由 librocksdb-sys 以 /O2 编译,不受此项影响)
+# 故意 *不* 设 panic="abort":本项目路由/service/admin 大量依赖 catch_unwind
+# 做请求级 panic 隔离(见 src/router/layers.rs 的 CatchPanicLayer、
+# src/service/manager.rs、src/admin/processor.rs),abort 会绕过隔离直接拖崩进程。
+# 产出落在 target/release-small/conduwuit.exe(与 release 隔离,不互相覆盖)。
+[profile.release-small]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+opt-level = "z"
+
 # release profile with debug symbols
 [profile.release-debuginfo]
 inherits = "release"

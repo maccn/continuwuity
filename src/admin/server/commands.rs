@@ -133,6 +133,13 @@ impl crate::Context<'_> {
 		self.write_str("Restarting server...").await
 	}
 
+	#[cfg(not(unix))]
+	pub(super) async fn restart(&self, _force: bool) -> Result {
+		// In-place re-exec is implemented via `execvp` in `main/restart.rs`, which
+		// is unix-only. There is no equivalent restart path on other platforms.
+		Err!("Restarting the server is only supported on unix platforms.")
+	}
+
 	pub(super) async fn shutdown(&self) -> Result {
 		self.bail_restricted()?;
 
